@@ -5,7 +5,7 @@ import time
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timezone
+from datetime import datetime
 
 SHEET_NAME = os.getenv("SHEET_NAME", "Asset Management")
 LOG_TAB = os.getenv("LOG_TAB", "Log")
@@ -13,19 +13,48 @@ SETTING_TAB = os.getenv("SETTING_TAB", "Setting")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
+# Use one session (more stable)
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": UA,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+})
+
 def get_xe_rate(from_curr: str, to_curr: str) -> float:
+    """
+    Fetch 1 FROM -> ? TO rate from XE convert page by regex parsing.
+    Returns float: 1 FROM = X TO
+    """
     url = f"https://www.xe.com/currencyconverter/convert/?Amount=1&From={from_curr}&To={to_curr}"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+    r = SESSION.get(url, timeout=20)
+
+    # Common failures: 403/429 or bot page
+    if r.status_code != 200:
+        raise RuntimeError(f"XE HTTP {r.status_code} for {from_curr}->{to_curr}")
+
     text = r.text
 
-    # Pattern 1: "THB": 34.50
-    m = re.search(rf'"{re.escape(to_curr)}"\s*:\s*(\d+\.\d+)', text)
+    # If XE serves a bot/challenge page, parsing will fail anyway
+    # (These keywords are common on blocked pages)
+    blocked_markers = ["captcha", "cloudflare", "challenge", "access denied"]
+    if any(m in text.lower() for m in blocked_markers):
+        raise RuntimeError(f"XE blocked/challenge page for {from_curr}->{to_curr}")
+
+    # Pattern 1: JSON-like "THB": 34.50
+    m = re.search(rf'"{re.escape(to_curr)}"\s*:\s*(\d+(?:\.\d+)?)', text)
+
     # Pattern 2 fallback: 34.50<span class="faded-digits">
     if not m:
         m = re.search(r'(\d+\.\d+)<span class="faded-digits">', text)
 
+    # Pattern 3 fallback: find a "toAmount" like field (sometimes exists)
+    if not m:
+        m = re.search(r'"toAmount"\s*:\s*"(\d+(?:\.\d+)?)"', text)
+
     if not m:
         raise RuntimeError(f"XE parse failed for {from_curr}->{to_curr}")
+
     return float(m.group(1))
 
 def kucoin_prices(coin: str) -> tuple[float, float]:
@@ -72,8 +101,6 @@ def load_settings(ws):
     return alert_bps, cooldown_min, coins, tg_token, tg_chat_id
 
 def ensure_headers(log_ws):
-    if log_ws.row_count == 0 or log_ws.get_all_values() == []:
-        pass
     # If sheet is empty, add header
     if len(log_ws.get_all_values()) == 0:
         log_ws.append_row([
@@ -92,11 +119,22 @@ def main():
 
     alert_bps, cooldown_min, coins, tg_token, tg_chat_id = load_settings(setting_ws)
 
-    # XE FX
+    # ---------------------------
+    # XE FX (Direct USD/MYR)
+    # ---------------------------
     usd_thb = get_xe_rate("USD", "THB")
     time.sleep(2)
+
     myr_thb = get_xe_rate("MYR", "THB")
-    usd_myr = usd_thb / myr_thb
+    time.sleep(2)
+
+    # ✅ Try direct USD/MYR from XE
+    usd_myr_source = "XE_DIRECT"
+    try:
+        usd_myr = get_xe_rate("USD", "MYR")   # 1 USD = X MYR
+    except Exception:
+        usd_myr = usd_thb / myr_thb
+        usd_myr_source = "DERIVED_USDTHB_DIV_MYRTHB"
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -108,14 +146,14 @@ def main():
             ku_bid, ku_ask = kucoin_prices(coin)
             lu_bid, lu_ask = luno_prices_myr(coin)
 
-            # Bid side row: Luno bid vs Ku ask
+            # Bid side: Luno bid vs Ku ask
             luno_usd = lu_bid / usd_myr
             spr = 10000 * ((luno_usd - ku_ask) / ((luno_usd + ku_ask) / 2))
             rows.append([ts, "Bid", coin, lu_bid, ku_ask, usd_myr, usd_thb, myr_thb, luno_usd, spr, ""])
             if spr >= alert_bps:
                 alerts.append((coin, "Bid", spr, luno_usd, ku_ask))
 
-            # Ask side row: Luno ask vs Ku bid
+            # Ask side: Luno ask vs Ku bid
             luno_usd = lu_ask / usd_myr
             spr = 10000 * ((luno_usd - ku_bid) / ((luno_usd + ku_bid) / 2))
             rows.append([ts, "Ask", coin, lu_ask, ku_bid, usd_myr, usd_thb, myr_thb, luno_usd, spr, ""])
@@ -128,7 +166,7 @@ def main():
     # Append rows in batch
     log_ws.append_rows(rows, value_input_option="USER_ENTERED")
 
-    # Telegram alerts (no cooldown here unless you want me to add a State sheet)
+    # Telegram alerts (basic threshold)
     if tg_token and tg_chat_id:
         for coin, side, spr, luno_usd, ku_price in alerts:
             msg = (
@@ -140,7 +178,7 @@ def main():
                 f"KuCoin(USDT): {ku_price}\n"
                 f"USD/THB (XE): {usd_thb}\n"
                 f"MYR/THB (XE): {myr_thb}\n"
-                f"USD/MYR (derived): {usd_myr}\n"
+                f"USD/MYR: {usd_myr} ({usd_myr_source})\n"
                 f"Time: {ts}"
             )
             send_telegram(tg_token, tg_chat_id, msg)
